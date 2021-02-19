@@ -164,14 +164,6 @@ class Exchange(Component, TimedIdentifiable):
             order.fill(trade)
 
 
-from typing import Callable
-from decimal import Decimal
-
-from tensortrade.core import Component, TimedIdentifiable
-from tensortrade.oms.instruments import TradingPair
-from tensortrade.oms.exchanges import Exchange, ExchangeOptions
-
-
 class IntradayExchange(Component, TimedIdentifiable):
     """An intraday exchange for use within a trading environment using IntradayObserver.
     Parameters
