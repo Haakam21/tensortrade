@@ -1,1 +1,1 @@
-from .exchange import Exchange, ExchangeOptions
+from .exchange import Exchange, IntradayExchange, ExchangeOptions
