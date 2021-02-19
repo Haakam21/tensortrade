@@ -162,3 +162,124 @@ class Exchange(Component, TimedIdentifiable):
 
         if trade:
             order.fill(trade)
+
+
+from typing import Callable
+from decimal import Decimal
+
+from tensortrade.core import Component, TimedIdentifiable
+from tensortrade.oms.instruments import TradingPair
+from tensortrade.oms.exchanges import Exchange, ExchangeOptions
+
+
+class IntradayExchange(Component, TimedIdentifiable):
+    """An intraday exchange for use within a trading environment using IntradayObserver.
+    Parameters
+    ----------
+    name : str
+        The name of the exchange.
+    service : `Union[Callable, str]`
+        The service to be used for filling orders.
+    options : `ExchangeOptions`
+        The options used to specify the setting of the exchange.
+    """
+
+    registered_name = "intraday_exchanges"
+
+    def __init__(self,
+                 name: str,
+                 service: Callable,
+                 options: ExchangeOptions = None):
+        self.name = name
+        self._service = service
+        self.options = options if options else ExchangeOptions()
+        self._price_streams_dict = {}
+        self._price_streams_list = []
+        self._episode = 0
+
+    def __call__(self, *streams_lists) -> "Exchange":
+        """Sets up the price streams used to generate the prices.
+        Parameters
+        ----------
+        *streams_lists
+            The positional arguments each being a price streams list.
+        Returns
+        -------
+        `Exchange`
+            The exchange the price streams lists were passed in for.
+        """
+        self._price_streams_dict = {}
+        for sl in streams_lists:
+            pair = "".join([c if c.isalnum() else "/" for c in sl[0].name])
+            self._price_streams_dict[pair] = [s.rename(self.name + ":/" + s.name) for s in sl]
+        self._price_streams_list = [dict(zip(self._price_streams_dict.keys(), values)) for values in zip(*self._price_streams_dict.values())]
+        return self
+
+    def streams(self) -> "List[Stream[float]]":
+        """Gets the price streams for the current exchange episode.
+        Returns
+        -------
+        `List[Stream[float]]`
+            The price streams for the current exchange episode.
+        """
+        return list(self._price_streams_list[self._episode].values())
+
+    def quote_price(self, trading_pair: "TradingPair") -> "Decimal":
+        """The quote price of a trading pair on the exchange, denoted in the
+        core instrument.
+        Parameters
+        ----------
+        trading_pair : `TradingPair`
+            The trading pair to get the quote price for.
+        Returns
+        -------
+        `Decimal`
+            The quote price of the specified trading pair, denoted in the core instrument.
+        """
+        price = Decimal(self._price_streams_dict[str(trading_pair)][self._episode].value)
+        price = price.quantize(Decimal(10)**-trading_pair.base.precision)
+        return price
+
+    def is_pair_tradable(self, trading_pair: 'TradingPair') -> bool:
+        """Whether or not the specified trading pair is tradable on this
+        exchange.
+        Parameters
+        ----------
+        trading_pair : `TradingPair`
+            The trading pair to test the tradability of.
+        Returns
+        -------
+        bool
+            Whether or not the pair is tradable.
+        """
+        return str(trading_pair) in self._price_streams_dict.keys()
+
+    def set_episode(self, episode: 'int') -> None:
+        """Sets the current episode for the exchange.
+        Parameters
+        ----------
+        episode: `int`
+            The episode to set.
+        """
+        self._episode = episode
+
+    def execute_order(self, order: 'Order', portfolio: 'Portfolio') -> None:
+        """Execute an order on the exchange.
+        Parameters
+        ----------
+        order: `Order`
+            The order to execute.
+        portfolio : `Portfolio`
+            The portfolio to use.
+        """
+        trade = self._service(
+            order=order,
+            base_wallet=portfolio.get_wallet(self.id, order.pair.base),
+            quote_wallet=portfolio.get_wallet(self.id, order.pair.quote),
+            current_price=self.quote_price(order.pair),
+            options=self.options,
+            clock=self.clock
+        )
+
+        if trade:
+            order.fill(trade)

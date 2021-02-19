@@ -2,7 +2,6 @@
 from typing import List
 
 
-import datetime as dt
 import numpy as np
 import pandas as pd
 
@@ -289,18 +288,16 @@ class TensorTradeObserver(Observer):
 
 
 class IntradayObserver(Observer):
-    """The IntradayObserver observer that is compatible with the other `default`
-    components.
+    """The intraday observer that is compatible with the other `default`
+    components and with IntradayExchange.
     Parameters
     ----------
     portfolio : `Portfolio`
         The portfolio to be used to create the internal data feed mechanism.
-    feed : `DataFeed`
-        The feed to be used to collect observations to the observation window.
-    renderer_feed : `DataFeed`
-        The feed to be used for giving information to the renderer.
-    stop_time : datetime.time
-        The time at which the episode will stop.
+    feeds : `DataFeed`
+        The feeds to be used to collect observations to the observation window.
+    renderer_feeds : `DataFeed`
+        The feeds to be used for giving information to the renderer.
     window_size : int
         The size of the observation window.
     min_periods : int
@@ -311,17 +308,15 @@ class IntradayObserver(Observer):
         Additional keyword arguments for observer creation.
     Attributes
     ----------
-    feed : `DataFeed`
-        The master feed in charge of streaming the internal, external, and
-        renderer data feeds.
-    stop_time : datetime.time
-        The time at which the episode will stop.
     window_size : int
         The size of the observation window.
     min_periods : int
         The amount of steps needed to warmup the `feed`.
     randomize : bool
         Whether or not a random episode is selected when reset.
+    feed : `DataFeed`
+        The master feed in charge of streaming the internal, external, and
+        renderer data feeds.
     history : `ObservationHistory`
         The observation history.
     renderer_history : `List[dict]`
@@ -330,34 +325,23 @@ class IntradayObserver(Observer):
 
     def __init__(self,
                  portfolio: 'Portfolio',
-                 feed: 'DataFeed' = None,
-                 renderer_feed: 'DataFeed' = None,
-                 stop_time: 'datetime.time' = dt.time(16, 0, 0),
+                 feeds: 'DataFeed' = None,
+                 renderer_feeds: 'DataFeed' = None,
                  window_size: int = 1,
                  min_periods: int = None,
                  randomize: bool = False,
                  **kwargs) -> None:
-        internal_group = Stream.group(_create_internal_streams(portfolio)).rename("internal")
-        external_group = Stream.group(feed.inputs).rename("external")
-
-        if renderer_feed:
-            renderer_group = Stream.group(renderer_feed.inputs).rename("renderer")
-
-            self.feed = DataFeed([
-                internal_group,
-                external_group,
-                renderer_group
-            ])
-        else:
-            self.feed = DataFeed([
-                internal_group,
-                external_group
-            ])
-
-        self.stop_time = stop_time
+        self.portfolio = portfolio
+        self.feeds = feeds
+        self.renderer_feeds = renderer_feeds
         self.window_size = window_size
         self.min_periods = min_periods
         self.randomize = randomize
+
+        self.set_feed(0)
+
+        self.num_episodes = len(feeds)
+        self.episode = -1
 
         self._observation_dtype = kwargs.get('dtype', np.float32)
         self._observation_lows = kwargs.get('observation_lows', -np.inf)
@@ -366,7 +350,6 @@ class IntradayObserver(Observer):
         self.history = ObservationHistory(window_size=window_size)
 
         initial_obs = self.feed.next()["external"]
-        initial_obs.pop('timestamp', None)
         n_features = len(initial_obs.keys())
 
         self._observation_space = Box(
@@ -376,21 +359,10 @@ class IntradayObserver(Observer):
             dtype=self._observation_dtype
         )
 
-        self.feed = self.feed.attach(portfolio)
-
         self.renderer_history = []
-
-        if self.randomize:
-          self.num_episodes = 0
-          while (self.feed.has_next()):
-            ts = self.feed.next()["external"]["timestamp"]
-            if ts.time() == self.stop_time:
-              self.num_episodes += 1
 
         self.feed.reset()
         self.warmup()
-
-        self.stop = False
 
     @property
     def observation_space(self) -> Space:
@@ -403,7 +375,6 @@ class IntradayObserver(Observer):
             for _ in range(self.min_periods):
                 if self.has_next():
                     obs_row = self.feed.next()["external"]
-                    obs_row.pop('timestamp', None)
                     self.history.push(obs_row)
 
     def observe(self, env: 'TradingEnv') -> np.array:
@@ -423,15 +394,7 @@ class IntradayObserver(Observer):
 
         # Push new observation to observation history
         obs_row = data["external"]
-        try:
-          obs_ts = obs_row.pop('timestamp')
-        except KeyError:
-          raise KeyError("Include Stream of Timestamps named 'timestamp' in feed")
         self.history.push(obs_row)
-
-        # Check if episode should be stopped
-        if obs_ts.time() == self.stop_time:
-          self.stop = True
 
         obs = self.history.observe()
         obs = obs.astype(self._observation_dtype)
@@ -444,22 +407,51 @@ class IntradayObserver(Observer):
         bool
             Whether there is another observation to be generated.
         """
-        return self.feed.has_next() and not self.stop
+        return self.feed.has_next()
 
     def reset(self) -> None:
-        """Resets the observer"""
+        """Resets the observer
+        Parameters
+        ----------
+        episode : `int`
+            The episode to set.
+        """
         self.renderer_history = []
         self.history.reset()
-
-        if self.randomize or not self.feed.has_next():
-          self.feed.reset()
-          if self.randomize:
-            episode_num = 0
-            while (episode_num < randrange(self.num_episodes)):
-              ts = self.feed.next()["external"]["timestamp"]
-              if ts.time() == self.stop_time:
-                episode_num += 1
-
+        self.feed.reset()
+        if self.randomize:
+            self.episode = randrange(self.num_episodes)
+        else:
+            self.episode = 0 if self.episode == self.num_episodes - 1 else self.episode + 1
+        self.set_feed(self.episode)
         self.warmup()
 
-        self.stop = False
+    def set_feed(self, episode: 'int') -> None:
+        """Sets the current feed.
+        Parameters
+        ----------
+        episode : `int`
+            The episodes of the feed to set.
+        """
+        for exchange in self.portfolio.exchanges:
+            exchange.set_episode(episode)
+
+        internal_group = Stream.group(_create_internal_streams(self.portfolio)).rename("internal")
+        external_group = Stream.group(self.feeds[episode].inputs).rename("external")
+
+        if self.renderer_feeds:
+            renderer_group = Stream.group(self.renderer_feeds[episode].inputs).rename("renderer")
+
+            self.feed = DataFeed([
+                internal_group,
+                external_group,
+                renderer_group
+            ])
+        else:
+            self.feed = DataFeed([
+                internal_group,
+                external_group
+            ])
+
+        self.feed = self.feed.attach(self.portfolio)
+        self.feed.compile()
